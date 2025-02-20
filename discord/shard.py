@@ -28,6 +28,7 @@ import asyncio
 import logging
 
 import aiohttp
+import yarl
 
 from .state import AutoShardedConnectionState
 from .client import Client
@@ -43,18 +44,19 @@ from .errors import (
 
 from .enums import Status
 
-from typing import TYPE_CHECKING, Any, Callable, Tuple, Type, Optional, List, Dict, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Tuple, Type, Optional, List, Dict
 
 if TYPE_CHECKING:
+    from typing_extensions import Unpack
     from .gateway import DiscordWebSocket
     from .activity import BaseActivity
-    from .enums import Status
-
-    EI = TypeVar('EI', bound='EventItem')
+    from .flags import Intents
+    from .types.gateway import SessionStartLimit
 
 __all__ = (
     'AutoShardedClient',
     'ShardInfo',
+    'SessionStartLimits',
 )
 
 _log = logging.getLogger(__name__)
@@ -77,12 +79,12 @@ class EventItem:
         self.shard: Optional['Shard'] = shard
         self.error: Optional[Exception] = error
 
-    def __lt__(self: EI, other: EI) -> bool:
+    def __lt__(self, other: object) -> bool:
         if not isinstance(other, EventItem):
             return NotImplemented
         return self.type < other.type
 
-    def __eq__(self: EI, other: EI) -> bool:
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, EventItem):
             return NotImplemented
         return self.type == other.type
@@ -97,7 +99,6 @@ class Shard:
         self._client: Client = client
         self._dispatch: Callable[..., None] = client.dispatch
         self._queue_put: Callable[[EventItem], None] = queue_put
-        self.loop: asyncio.AbstractEventLoop = self._client.loop
         self._disconnect: bool = False
         self._reconnect = client._reconnect
         self._backoff: ExponentialBackoff = ExponentialBackoff()
@@ -117,7 +118,7 @@ class Shard:
         return self.ws.shard_id  # type: ignore
 
     def launch(self) -> None:
-        self._task = self.loop.create_task(self.worker())
+        self._task = self._client.loop.create_task(self.worker())
 
     def _cancel_task(self) -> None:
         if self._task is not None and not self._task.done():
@@ -181,11 +182,12 @@ class Shard:
         self._cancel_task()
         self._dispatch('disconnect')
         self._dispatch('shard_disconnect', self.id)
-        _log.info('Got a request to %s the websocket at Shard ID %s.', exc.op, self.id)
+        _log.debug('Got a request to %s the websocket at Shard ID %s.', exc.op, self.id)
         try:
             coro = DiscordWebSocket.from_client(
                 self._client,
                 resume=exc.resume,
+                gateway=None if not exc.resume else self.ws.gateway,
                 shard_id=self.id,
                 session=self.ws.session_id,
                 sequence=self.ws.sequence,
@@ -193,6 +195,10 @@ class Shard:
             self.ws = await asyncio.wait_for(coro, timeout=60.0)
         except self._handled_exceptions as e:
             await self._handle_disconnect(e)
+        except ReconnectWebSocket as e:
+            _log.debug('Somehow got a signal to %s while trying to %s shard ID %s.', e.op, exc.op, self.id)
+            op = EventType.resume if e.resume else EventType.identify
+            self._queue_put(EventItem(op, self, e))
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -290,6 +296,32 @@ class ShardInfo:
         return self._parent.ws.is_ratelimited()
 
 
+class SessionStartLimits:
+    """A class that holds info about session start limits
+
+    .. versionadded:: 2.5
+
+    Attributes
+    ----------
+    total: :class:`int`
+        The total number of session starts the current user is allowed
+    remaining: :class:`int`
+        Remaining remaining number of session starts the current user is allowed
+    reset_after: :class:`int`
+        The number of milliseconds until the limit resets
+    max_concurrency: :class:`int`
+        The number of identify requests allowed per 5 seconds
+    """
+
+    __slots__ = ("total", "remaining", "reset_after", "max_concurrency")
+
+    def __init__(self, **kwargs: Unpack[SessionStartLimit]):
+        self.total: int = kwargs['total']
+        self.remaining: int = kwargs['remaining']
+        self.reset_after: int = kwargs['reset_after']
+        self.max_concurrency: int = kwargs['max_concurrency']
+
+
 class AutoShardedClient(Client):
     """A client similar to :class:`Client` except it handles the complications
     of sharding for the user into a more manageable and transparent single
@@ -311,19 +343,34 @@ class AutoShardedClient(Client):
     if this is used. By default, when omitted, the client will launch shards from
     0 to ``shard_count - 1``.
 
+    .. container:: operations
+
+        .. describe:: async with x
+
+            Asynchronously initialises the client and automatically cleans up.
+
+            .. versionadded:: 2.0
+
     Attributes
     ------------
     shard_ids: Optional[List[:class:`int`]]
         An optional list of shard_ids to launch the shards with.
+    shard_connect_timeout: Optional[:class:`float`]
+        The maximum number of seconds to wait before timing out when launching a shard.
+        Defaults to 180 seconds.
+
+        .. versionadded:: 2.4
     """
 
     if TYPE_CHECKING:
         _connection: AutoShardedConnectionState
 
-    def __init__(self, *args: Any, loop: Optional[asyncio.AbstractEventLoop] = None, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, intents: Intents, **kwargs: Any) -> None:
         kwargs.pop('shard_id', None)
         self.shard_ids: Optional[List[int]] = kwargs.pop('shard_ids', None)
-        super().__init__(*args, loop=loop, **kwargs)
+        self.shard_connect_timeout: Optional[float] = kwargs.pop('shard_connect_timeout', 180.0)
+
+        super().__init__(*args, intents=intents, **kwargs)
 
         if self.shard_ids is not None:
             if self.shard_count is None:
@@ -336,7 +383,6 @@ class AutoShardedClient(Client):
         self.__shards = {}
         self._connection._get_websocket = self._get_websocket
         self._connection._get_client = lambda: self
-        self.__queue = asyncio.PriorityQueue()
 
     def _get_websocket(self, guild_id: Optional[int] = None, *, shard_id: Optional[int] = None) -> DiscordWebSocket:
         if shard_id is None:
@@ -350,7 +396,6 @@ class AutoShardedClient(Client):
             handlers=self._handlers,
             hooks=self._hooks,
             http=self.http,
-            loop=self.loop,
             **options,
         )
 
@@ -374,8 +419,19 @@ class AutoShardedClient(Client):
         """
         return [(shard_id, shard.ws.latency) for shard_id, shard in self.__shards.items()]
 
-    def get_shard(self, shard_id: int) -> Optional[ShardInfo]:
-        """Optional[:class:`ShardInfo`]: Gets the shard information at a given shard ID or ``None`` if not found."""
+    def get_shard(self, shard_id: int, /) -> Optional[ShardInfo]:
+        """
+        Gets the shard information at a given shard ID or ``None`` if not found.
+
+        .. versionchanged:: 2.0
+
+            ``shard_id`` parameter is now positional-only.
+
+        Returns
+        --------
+        Optional[:class:`ShardInfo`]
+            Information about the shard with given ID. ``None`` if not found.
+        """
         try:
             parent = self.__shards[shard_id]
         except KeyError:
@@ -388,10 +444,37 @@ class AutoShardedClient(Client):
         """Mapping[int, :class:`ShardInfo`]: Returns a mapping of shard IDs to their respective info object."""
         return {shard_id: ShardInfo(parent, self.shard_count) for shard_id, parent in self.__shards.items()}
 
-    async def launch_shard(self, gateway: str, shard_id: int, *, initial: bool = False) -> None:
+    async def fetch_session_start_limits(self) -> SessionStartLimits:
+        """|coro|
+
+        Get the session start limits.
+
+        This is not typically needed, and will be handled for you by default.
+
+        At the point where you are launching multiple instances
+        with manual shard ranges and are considered required to use large bot
+        sharding by Discord, this function when used along IPC and a
+        before_identity_hook can speed up session start.
+
+        .. versionadded:: 2.5
+
+        Returns
+        -------
+        :class:`SessionStartLimits`
+            A class containing the session start limits
+
+        Raises
+        ------
+        GatewayNotFound
+            The gateway was unreachable
+        """
+        _, _, limits = await self.http.get_bot_gateway()
+        return SessionStartLimits(**limits)
+
+    async def launch_shard(self, gateway: yarl.URL, shard_id: int, *, initial: bool = False) -> None:
         try:
             coro = DiscordWebSocket.from_client(self, initial=initial, gateway=gateway, shard_id=shard_id)
-            ws = await asyncio.wait_for(coro, timeout=180.0)
+            ws = await asyncio.wait_for(coro, timeout=self.shard_connect_timeout)
         except Exception:
             _log.exception('Failed to connect for shard_id: %s. Retrying...', shard_id)
             await asyncio.sleep(5.0)
@@ -402,10 +485,15 @@ class AutoShardedClient(Client):
         ret.launch()
 
     async def launch_shards(self) -> None:
+        if self.is_closed():
+            return
+
         if self.shard_count is None:
-            self.shard_count, gateway = await self.http.get_bot_gateway()
+            self.shard_count: int
+            self.shard_count, gateway_url, _session_start_limit = await self.http.get_bot_gateway()
+            gateway = yarl.URL(gateway_url)
         else:
-            gateway = await self.http.get_gateway()
+            gateway = DiscordWebSocket.DEFAULT_GATEWAY
 
         self._connection.shard_count = self.shard_count
 
@@ -416,7 +504,9 @@ class AutoShardedClient(Client):
             initial = shard_id == shard_ids[0]
             await self.launch_shard(gateway, shard_id, initial=initial)
 
-        self._connection.shards_launched.set()
+    async def _async_setup_hook(self) -> None:
+        await super()._async_setup_hook()
+        self.__queue = asyncio.PriorityQueue()
 
     async def connect(self, *, reconnect: bool = True) -> None:
         self._reconnect = reconnect
@@ -447,30 +537,28 @@ class AutoShardedClient(Client):
 
         Closes the connection to Discord.
         """
-        if self.is_closed():
-            return
+        if self._closing_task:
+            return await self._closing_task
 
-        self._closed = True
+        async def _close():
+            await self._connection.close()
 
-        for vc in self.voice_clients:
-            try:
-                await vc.disconnect(force=True)
-            except Exception:
-                pass
+            to_close = [asyncio.ensure_future(shard.close(), loop=self.loop) for shard in self.__shards.values()]
+            if to_close:
+                await asyncio.wait(to_close)
 
-        to_close = [asyncio.ensure_future(shard.close(), loop=self.loop) for shard in self.__shards.values()]
-        if to_close:
-            await asyncio.wait(to_close)
+            await self.http.close()
+            self.__queue.put_nowait(EventItem(EventType.clean_close, None, None))
 
-        await self.http.close()
-        self.__queue.put_nowait(EventItem(EventType.clean_close, None, None))
+        self._closing_task = asyncio.create_task(_close())
+        await self._closing_task
 
     async def change_presence(
         self,
         *,
         activity: Optional[BaseActivity] = None,
         status: Optional[Status] = None,
-        shard_id: int = None,
+        shard_id: Optional[int] = None,
     ) -> None:
         """|coro|
 
@@ -483,6 +571,10 @@ class AutoShardedClient(Client):
 
         .. versionchanged:: 2.0
             Removed the ``afk`` keyword-only parameter.
+
+        .. versionchanged:: 2.0
+            This function will now raise :exc:`TypeError` instead of
+            ``InvalidArgument``.
 
         Parameters
         ----------
@@ -498,7 +590,7 @@ class AutoShardedClient(Client):
 
         Raises
         ------
-        InvalidArgument
+        TypeError
             If the ``activity`` parameter is not of proper type.
         """
 
